@@ -1,61 +1,60 @@
-import os
-from datasets import load_dataset
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments
-torch.cuda.empty_cache()
-# Step 1: Load and preprocess the dataset from the JSONL file
-dataset = load_dataset("json", data_files="./data.jsonl")
+from transformers import GPT2Tokenizer, GPT2LMHeadModel, GPT2Config, Trainer, TrainingArguments
+from datasets import load_dataset
 
-# Split the dataset into train and eval (if you don't have a separate eval dataset)
-train_test_split = dataset['train'].train_test_split(test_size=0.1)  # Adjust the test size as needed
-train_dataset = train_test_split['train']
-eval_dataset = train_test_split['test']
+# Tokenize and add labels
+def tokenize_function(examples, tokenizer):
+    # Tokenize both input_ids and labels fields
+    input_tokens = tokenizer(examples['input_ids'], truncation=True, padding='max_length', max_length=512)
+    label_tokens = tokenizer(examples['labels'], truncation=True, padding='max_length', max_length=512)
+    
+    # Set input_ids and labels
+    input_tokens['labels'] = label_tokens['input_ids']  # Labels should match the tokenized labels
+    return input_tokens
 
-# Step 2: Load the pre-trained model and tokenizer
-model_name = "EleutherAI/gpt-neo-1.3B"  # Change this to the correct model name if needed
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForCausalLM.from_pretrained(model_name)
+# Main training function
+def train_model(jsonl_file_path, output_dir):
+    # Check if GPU is available
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
 
-# Step 3: Tokenize the data
-def tokenize_function(examples):
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token 
-    return tokenizer(examples['input_ids'], examples['labels'], padding="max_length", truncation=True)
+    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+    tokenizer.pad_token = tokenizer.eos_token
 
-# Apply tokenization to the training dataset
-train_dataset = train_dataset.map(tokenize_function, batched=True)
+    # Prepare dataset
+    dataset = load_dataset("json", data_files=jsonl_file_path, split='train')  # Specify jsonl format
+    tokenized_datasets = dataset.map(lambda x: tokenize_function(x, tokenizer), batched=True)
 
-# Apply tokenization to the evaluation (test) dataset
-eval_dataset = eval_dataset.map(tokenize_function, batched=True)
+    # Load model and move to GPU if available
+    config = GPT2Config.from_pretrained("gpt2", output_hidden_states=False)
+    model = GPT2LMHeadModel.from_pretrained("gpt2", config=config).to(device)
 
-# Step 4: Define training arguments
-training_args = TrainingArguments(
-    output_dir="./results",          # Output directory for model checkpoints
-    evaluation_strategy="epoch",     # Evaluation strategy during training
-    learning_rate=2e-5,              # Learning rate
-    per_device_train_batch_size=2,# Batch size for training
-    gradient_accumulation_steps=4,
-    num_train_epochs=3,              # Number of training epochs
-    weight_decay=0.01,               # Strength of weight decay
-    save_steps=10_000,               # Save model checkpoints every 10k steps
-    logging_dir="./logs",            # Directory to save logs
-    fp16=True,
-)
+    # Set up training arguments
+    training_args = TrainingArguments(
+        output_dir=output_dir,
+        num_train_epochs=10,
+        per_device_train_batch_size=8,
+        save_steps=10_000,
+        save_total_limit=2,
+        logging_dir=f'{output_dir}/logs',
+        logging_steps=200,
+        prediction_loss_only=True,
+        # Enable GPU usage
+        no_cuda=not torch.cuda.is_available()
+    )
 
-# Step 5: Initialize the Trainer with tokenized datasets
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,  # Tokenized train dataset
-    eval_dataset=eval_dataset,    # Tokenized eval dataset
-)
+    # Trainer
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized_datasets,
+        tokenizer=tokenizer
+    )
 
-# Step 6: Fine-tune the model
-trainer.train()
+    trainer.train()
+    model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    print(f"Model saved to {output_dir}")
 
-# Step 7: Save the fine-tuned model and tokenizer
-output_dir = "fine_tuned_model"
-model.save_pretrained(output_dir)
-tokenizer.save_pretrained(output_dir)
-
-print(f"Fine-tuning complete. Model saved to {output_dir}.")
+if __name__ == "__main__":
+    train_model("data.jsonl", "trained_model")  # Replace with your actual file path
